@@ -3,6 +3,7 @@
 
 #include "wasmedge/wasmedge.h"
 
+#include "api/internal/managed_ref_getter.h"
 #include "common/defines.h"
 #include "driver/compiler.h"
 #include "driver/tool.h"
@@ -32,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -188,6 +190,29 @@ inline ValType genValType(const WasmEdge_ValType &T) noexcept {
   return ValType(R);
 }
 
+// The runtime retains only struct/array refs (see Executor::invoke); releasing
+// any other value could drop an unrelated root by pointer-identity collision,
+// so restrict the release APIs to GC ref types.
+//
+// Returns the retained-root RefVariant for a releasable value (a non-null GC
+// ref), or nullopt otherwise. Centralizes the value->RefVariant decode shared
+// by every release entry point below.
+inline std::optional<RefVariant>
+genRetainedRef(const WasmEdge_Value &Val) noexcept {
+  const ValType VT = genValType(Val.Type);
+  if (!VT.isRefType() || !VT.isGCRefType()) {
+    return std::nullopt;
+  }
+  const RefVariant Ref = ValVariant::wrap<RefVariant>(
+                             to_WasmEdge_128_t<WasmEdge::uint128_t>(Val.Value))
+                             .get<RefVariant>();
+  // Null references are never retained roots (mirrors Executor::releaseRef).
+  if (Ref.isNull()) {
+    return std::nullopt;
+  }
+  return Ref;
+}
+
 inline std::filesystem::path genPath(const char *Path) {
   return (Path && *Path) ? std::filesystem::absolute(Path)
                          : std::filesystem::path();
@@ -211,6 +236,33 @@ inline WasmEdge_Value genWasmEdge_Value(const ValVariant &Val,
                                         const ValType &T) noexcept {
   return WasmEdge_Value{/* Value */ to_uint128_t(Val.unwrap()),
                         /* Type */ genWasmEdge_ValType(T)};
+}
+
+// The legacy managed-ref getter restriction predicate,
+// isRestrictedManagedRefGetterType, is shared with the GC test suite via
+// include/api/internal/managed_ref_getter.h, so the test asserts against the
+// exact function called below. See that header for the full rationale,
+// including the deliberate externref exclusion.
+
+// The canonical sentinel a restricted managed-ref getter returns: a null
+// reference of the slot's declared type \p RT, built the same way a
+// defaultable reference-typed slot is default-initialized elsewhere. Logs a
+// warning because a defined-error return is not representable in the bare
+// WasmEdge_Value / WasmEdge_TableInstanceGetData signatures. This is also the
+// only representable sentinel for a NON-nullable managed-ref slot, where it is
+// a non-round-trippable error indicator rather than a usable value: feeding it
+// back into WasmEdge_GlobalInstanceCreate /
+// WasmEdge_TableInstanceCreateWithInit is caller misuse that trips the
+// construction invariant.
+inline WasmEdge_Value genManagedRefGetterSentinel(const ValType &RT) noexcept {
+  spdlog::warn(
+      "A managed-ref getter (WasmEdge_GlobalInstanceGetValue / "
+      "WasmEdge_TableInstanceGetData) returned a typed-null sentinel instead "
+      "of the stored value: an unretained borrowed managed reference is not "
+      "rooted for the host and a concurrent collection could reclaim it; use "
+      "a retained getter that roots the reference for the host (see the API "
+      "documentation) to obtain a rooted managed reference."sv);
+  return genWasmEdge_Value(WasmEdge::RefVariant(RT), RT);
 }
 
 // Helper function for converting a WasmEdge_Value array to a ValVariant
@@ -277,8 +329,10 @@ inline std::string_view genStrView(const WasmEdge_String S) noexcept {
   return std::string_view(S.Buf, S.Length);
 }
 
-// Helper functions for converting a ValVariant vector to a WasmEdge_Value
-// array.
+// Convert a ValVariant vector to a WasmEdge_Value array. Pure formatter: never
+// mutates GC retention, so re-fetching callers (WasmEdge_AsyncGet over a
+// shared_future) can call it repeatedly. Releasing refs the buffer cannot hold
+// is releaseOverflowRefs's job, below.
 inline constexpr void
 fillWasmEdge_ValueArr(Span<const std::pair<ValVariant, ValType>> Vec,
                       WasmEdge_Value *Val, const uint32_t Len) noexcept {
@@ -287,6 +341,35 @@ fillWasmEdge_ValueArr(Span<const std::pair<ValVariant, ValType>> Vec,
   }
   for (uint32_t I = 0; I < Len && I < Vec.size(); I++) {
     Val[I] = genWasmEdge_Value(Vec[I].first, Vec[I].second);
+  }
+}
+
+// Release the roots Executor::invoke retained for returned GC references that
+// overflow the host buffer and are dropped by fillWasmEdge_ValueArr; the host
+// gets no handle to release them otherwise.
+//
+// Call ONLY on a terminal path that owns and discards the result (synchronous
+// invoke/run/execute). NOT on WasmEdge_AsyncGet, which re-reads a
+// shared_future: a later larger-buffer fetch must still see every reference.
+//
+// Externalized refs appear as externref, fall outside isGCRefType, and remain
+// releasable only via releaseAllRefs.
+inline void releaseOverflowRefs(Span<const std::pair<ValVariant, ValType>> Vec,
+                                const WasmEdge_Value *Val, const uint32_t Len,
+                                GC::Allocator &Alloc) noexcept {
+  // Mirror fillWasmEdge_ValueArr's kept count: none if no buffer, else
+  // min(Len, size).
+  uint32_t Kept = 0;
+  if (Val != nullptr) {
+    Kept = (Len < Vec.size()) ? Len : static_cast<uint32_t>(Vec.size());
+  }
+  for (uint32_t I = Kept; I < Vec.size(); I++) {
+    if (Vec[I].second.isGCRefType()) {
+      const RefVariant Ref = Vec[I].first.get<RefVariant>();
+      if (!Ref.isNull()) {
+        Alloc.releaseRef(Ref);
+      }
+    }
   }
 }
 
@@ -2194,7 +2277,11 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_ExecutorInvoke(
           return fromExecutorCxt(Cxt)->invoke(
               fromFuncCxt(FuncCxt), ParamPair.first, ParamPair.second);
         },
-        [&](auto &&Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto &&Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              fromExecutorCxt(Cxt)->getAllocator());
+        },
         Cxt, FuncCxt);
   } catch (...) {
     return handleCAPIError();
@@ -2209,8 +2296,16 @@ WasmEdge_ExecutorAsyncInvoke(WasmEdge_ExecutorContext *Cxt,
   try {
     if (Cxt && FuncCxt) {
       auto ParamPair = genParamPair(Params, ParamLen);
-      return new WasmEdge_Async(fromExecutorCxt(Cxt)->asyncInvoke(
-          fromFuncCxt(FuncCxt), ParamPair.first, ParamPair.second));
+      auto Produced = fromExecutorCxt(Cxt)->asyncInvoke(
+          fromFuncCxt(FuncCxt), ParamPair.first, ParamPair.second);
+      // A refused invoke (closing controller / un-pinnable target) yields an
+      // invalid Async (empty shared_future). Returning a non-null handle for
+      // it would let AsyncWait/AsyncGet call an empty future -> future_error
+      // out of noexcept -> terminate. Return nullptr instead.
+      if (!Produced.valid()) {
+        return nullptr;
+      }
+      return new WasmEdge_Async(std::move(Produced));
     }
   } catch (...) {
     handleCAPIError();
@@ -2219,7 +2314,65 @@ WasmEdge_ExecutorAsyncInvoke(WasmEdge_ExecutorContext *Cxt,
 }
 
 WASMEDGE_CAPI_EXPORT void
+WasmEdge_ExecutorReleaseRef(WasmEdge_ExecutorContext *Cxt,
+                            const WasmEdge_Value Ref) noexcept {
+  // Only retained GC refs may be released (see genRetainedRef); mirrors
+  // WasmEdge_VMReleaseRef for the direct Executor.
+  if (Cxt) {
+    if (const auto RetainedRef = genRetainedRef(Ref)) {
+      fromExecutorCxt(Cxt)->releaseRef(*RetainedRef);
+    }
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void
+WasmEdge_ExecutorReleaseRefs(WasmEdge_ExecutorContext *Cxt,
+                             const WasmEdge_Value *Refs,
+                             const uint32_t Len) noexcept {
+  if (Cxt && Refs) {
+    // Release per element, not via a vector: noexcept, and a host-controlled
+    // Len could throw on a vector grow (see WasmEdge_VMReleaseRefs).
+    for (uint32_t I = 0; I < Len; ++I) {
+      if (const auto RetainedRef = genRetainedRef(Refs[I])) {
+        fromExecutorCxt(Cxt)->releaseRef(*RetainedRef);
+      }
+    }
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void
+WasmEdge_ExecutorReleaseAllRefs(WasmEdge_ExecutorContext *Cxt) noexcept {
+  if (Cxt) {
+    fromExecutorCxt(Cxt)->releaseAllRefs();
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void
 WasmEdge_ExecutorDelete(WasmEdge_ExecutorContext *Cxt) noexcept {
+  if (Cxt &&
+      fromExecutorCxt(Cxt)->getController().outstandingHandleLeases() > 0) {
+    // Handle-before-producer misuse: a live (undeleted) async handle still
+    // co-owns a result lease, so the teardown drain would block forever (the
+    // handle can only be released by WasmEdge_AsyncDelete). Reject fail-fast --
+    // delete every async handle produced by this executor before deleting the
+    // executor.
+    spdlog::error(
+        "WasmEdge_ExecutorDelete called while a live async handle produced by "
+        "this executor is still undeleted. The deletion is rejected; call "
+        "WasmEdge_AsyncDelete on every async handle before deleting the "
+        "executor."sv);
+    return;
+  }
+  if (Cxt && fromExecutorCxt(Cxt)->getController().currentThreadRegistered()) {
+    // Self-teardown from inside this executor's own host callback: reject
+    // (documented usage error, see WasmEdge_VMDelete) -- the caller still
+    // owns the executor; delete it after the invocation returns.
+    spdlog::error(
+        "WasmEdge_ExecutorDelete called from inside one of this executor's "
+        "own host callbacks (self-teardown). The deletion is rejected; delete "
+        "the executor after the invocation returns."sv);
+    return;
+  }
   delete fromExecutorCxt(Cxt);
 }
 
@@ -2276,8 +2429,12 @@ WasmEdge_StoreDelete(WasmEdge_StoreContext *Cxt) noexcept {
 WASMEDGE_CAPI_EXPORT WasmEdge_ModuleInstanceContext *
 WasmEdge_ModuleInstanceCreate(const WasmEdge_String ModuleName) noexcept {
   try {
-    return toModCxt(new WasmEdge::Runtime::Instance::ModuleInstance(
-        genStrView(ModuleName)));
+    auto *Mod =
+        new WasmEdge::Runtime::Instance::ModuleInstance(genStrView(ModuleName));
+    // Deleted via WasmEdge_ModuleInstanceDelete -> terminate():
+    // async-pinnable (see module.h).
+    Mod->setDeferrableStorage();
+    return toModCxt(Mod);
   } catch (...) {
     handleCAPIError();
     return nullptr;
@@ -2295,6 +2452,9 @@ WasmEdge_ModuleInstanceCreateWASIWithFds(
     WasmEdge_ModuleInstanceInitWASIWithFds(
         toModCxt(WasiMod.get()), Args, ArgLen, Envs, EnvLen, Preopens,
         PreopenLen, StdInFd, StdOutFd, StdErrFd);
+    // Deleted via WasmEdge_ModuleInstanceDelete -> terminate():
+    // async-pinnable (see module.h).
+    WasiMod->setDeferrableStorage();
     return toModCxt(WasiMod.release());
   } catch (...) {
     handleCAPIError();
@@ -2313,6 +2473,9 @@ WasmEdge_ModuleInstanceCreateWASI(const char *const *Args,
     auto WasiMod = std::make_unique<WasmEdge::Host::WasiModule>();
     WasmEdge_ModuleInstanceInitWASI(toModCxt(WasiMod.get()), Args, ArgLen, Envs,
                                     EnvLen, Preopens, PreopenLen);
+    // Deleted via WasmEdge_ModuleInstanceDelete -> terminate():
+    // async-pinnable (see module.h).
+    WasiMod->setDeferrableStorage();
     return toModCxt(WasiMod.release());
   } catch (...) {
     handleCAPIError();
@@ -2325,8 +2488,12 @@ WasmEdge_ModuleInstanceCreateWithData(const WasmEdge_String ModuleName,
                                       void *HostData,
                                       void (*Finalizer)(void *)) noexcept {
   try {
-    return toModCxt(new WasmEdge::Runtime::Instance::ModuleInstance(
-        genStrView(ModuleName), HostData, Finalizer));
+    auto *Mod = new WasmEdge::Runtime::Instance::ModuleInstance(
+        genStrView(ModuleName), HostData, Finalizer);
+    // Deleted via WasmEdge_ModuleInstanceDelete -> terminate():
+    // async-pinnable (see module.h).
+    Mod->setDeferrableStorage();
+    return toModCxt(Mod);
   } catch (...) {
     handleCAPIError();
     return nullptr;
@@ -2773,7 +2940,8 @@ WasmEdge_TableInstanceCreate(
         spdlog::error(WasmEdge::ErrCode::Value::NonNullRequired);
         return nullptr;
       }
-      return toTabCxt(new WasmEdge::Runtime::Instance::TableInstance(TType));
+      return toTabCxt(new WasmEdge::Runtime::Instance::TableInstance(
+          TType, resolveCanHoldManagedNoTypeList(TType.getRefType())));
     }
   } catch (...) {
     handleCAPIError();
@@ -2805,8 +2973,8 @@ WasmEdge_TableInstanceCreateWithInit(const WasmEdge_TableTypeContext *TabType,
         spdlog::error(WasmEdge::ErrCode::Value::NonNullRequired);
         return nullptr;
       }
-      return toTabCxt(
-          new WasmEdge::Runtime::Instance::TableInstance(TType, Val));
+      return toTabCxt(new WasmEdge::Runtime::Instance::TableInstance(
+          TType, Val, resolveCanHoldManagedNoTypeList(TType.getRefType())));
     }
   } catch (...) {
     handleCAPIError();
@@ -2828,10 +2996,44 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_TableInstanceGetData(
     const uint64_t Offset) noexcept {
   return wrap([&]() { return fromTabCxt(Cxt)->getRefAddr(Offset); },
               [&Data, &Cxt](auto &&Res) {
-                *Data = genWasmEdge_Value(
-                    *Res, fromTabCxt(Cxt)->getTableType().getRefType());
+                const WasmEdge::ValType &RefType =
+                    fromTabCxt(Cxt)->getTableType().getRefType();
+                // A managed-ref slot -- do not hand out the unretained
+                // borrowed ref just read into Res; it is not a scanned host
+                // root, so return the sentinel instead. See
+                // isRestrictedManagedRefGetterType.
+                if (isRestrictedManagedRefGetterType(
+                        fromTabCxt(Cxt)->canHoldManaged(), RefType)) {
+                  *Data = genManagedRefGetterSentinel(RefType);
+                  return;
+                }
+                *Data = genWasmEdge_Value(*Res, RefType);
               },
               Cxt, Data);
+}
+
+WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_TableInstanceGetDataRetained(
+    WasmEdge_ExecutorContext *ExecCxt, const WasmEdge_TableInstanceContext *Cxt,
+    WasmEdge_Value *Data, const uint64_t Offset) noexcept {
+  return wrap(
+      [&]() -> WasmEdge::Expect<WasmEdge_Value> {
+        const auto *Tab = fromTabCxt(Cxt);
+        auto *Exec = fromExecutorCxt(ExecCxt);
+        // Producer-scoped: reject an instance owned by a DIFFERENT controller
+        // up front, before reading the slot, so a foreign query never reads or
+        // roots an object this executor does not own. An unattached table
+        // (Allocator == nullptr) is NOT foreign and proceeds normally.
+        if (Tab->hasForeignAllocator(Exec->getAllocator())) {
+          spdlog::error(WasmEdge::ErrCode::Value::IncompatibleImportType);
+          return Unexpect(WasmEdge::ErrCode::Value::IncompatibleImportType);
+        }
+        EXPECTED_TRY(auto Retained,
+                     retainManagedRefFromSlot(
+                         *Exec, Tab->getTableType().getRefType(),
+                         [&]() { return Tab->getRefAddr(Offset); }));
+        return genWasmEdge_Value(Retained.first, Retained.second);
+      },
+      [&Data](auto &&Res) { *Data = *Res; }, ExecCxt, Cxt, Data);
 }
 
 WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_TableInstanceSetData(
@@ -2839,6 +3041,15 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_TableInstanceSetData(
     const uint64_t Offset) noexcept {
   return wrap(
       [&]() -> WasmEdge::Expect<void> {
+        // Refuse a raw mutation on a table a GC controller manages. The C-API
+        // cannot prove the caller's controller matches the owner, so a managed
+        // store here could barrier against the wrong allocator (a reachable
+        // object swept). A standalone (unattached) table, or an attached but
+        // non-managed table, is unaffected -- see isManagedByController().
+        if (fromTabCxt(Cxt)->isManagedByController()) {
+          spdlog::error(WasmEdge::ErrCode::Value::IncompatibleImportType);
+          return Unexpect(WasmEdge::ErrCode::Value::IncompatibleImportType);
+        }
         // Comparison of the value types needs the module instance to retrieve
         // the function type index after applying the typed function reference
         // proposal. It's impossible to do this without refactoring. Therefore
@@ -2878,6 +3089,14 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_TableInstanceGrow(
     WasmEdge_TableInstanceContext *Cxt, const uint64_t Size) noexcept {
   return wrap(
       [&]() -> WasmEdge::Expect<void> {
+        // Refuse a raw grow on a table a GC controller manages. The raw path
+        // cannot prove the caller's controller matches the owner, so a
+        // reallocating grow could stop-the-world on / retire buffers against
+        // the wrong allocator. A standalone or non-managed table is unaffected.
+        if (fromTabCxt(Cxt)->isManagedByController()) {
+          spdlog::error(WasmEdge::ErrCode::Value::IncompatibleImportType);
+          return Unexpect(WasmEdge::ErrCode::Value::IncompatibleImportType);
+        }
         if (fromTabCxt(Cxt)->growTable(Size)) {
           return {};
         } else {
@@ -3045,8 +3264,8 @@ WasmEdge_GlobalInstanceCreate(const WasmEdge_GlobalTypeContext *GlobType,
           return nullptr;
         }
       }
-      return toGlobCxt(
-          new WasmEdge::Runtime::Instance::GlobalInstance(GType, Val));
+      return toGlobCxt(new WasmEdge::Runtime::Instance::GlobalInstance(
+          GType, resolveCanHoldManagedNoTypeList(GType.getValType()), Val));
     }
   } catch (...) {
     handleCAPIError();
@@ -3066,12 +3285,49 @@ WasmEdge_GlobalInstanceGetGlobalType(
 WASMEDGE_CAPI_EXPORT WasmEdge_Value WasmEdge_GlobalInstanceGetValue(
     const WasmEdge_GlobalInstanceContext *Cxt) noexcept {
   if (Cxt) {
-    return genWasmEdge_Value(fromGlobCxt(Cxt)->getValue(),
-                             fromGlobCxt(Cxt)->getGlobalType().getValType());
+    const auto *Glob = fromGlobCxt(Cxt);
+    const WasmEdge::ValType &ValT = Glob->getGlobalType().getValType();
+    // A managed-ref slot -- do not hand out the unretained borrowed ref
+    // getValue() would return; it is not added to HostRoots, so return the
+    // sentinel instead. See isRestrictedManagedRefGetterType.
+    if (isRestrictedManagedRefGetterType(Glob->canHoldManaged(), ValT)) {
+      return genManagedRefGetterSentinel(ValT);
+    }
+    return genWasmEdge_Value(Glob->getValue(), ValT);
   }
   return genWasmEdge_Value(
       WasmEdge::ValVariant(static_cast<WasmEdge::uint128_t>(0U)),
       TypeCode::I32);
+}
+
+WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_GlobalInstanceGetValueRetained(
+    WasmEdge_ExecutorContext *ExecCxt,
+    const WasmEdge_GlobalInstanceContext *Cxt, WasmEdge_Value *Value) noexcept {
+  return wrap(
+      [&]() -> WasmEdge::Expect<WasmEdge_Value> {
+        const auto *Glob = fromGlobCxt(Cxt);
+        auto *Exec = fromExecutorCxt(ExecCxt);
+        // Producer-scoped: reject an instance owned by a DIFFERENT controller
+        // up front, before reading the slot, so a foreign query never reads or
+        // roots an object this executor does not own. An unattached global
+        // (Allocator == nullptr) is NOT foreign and proceeds normally.
+        if (Glob->hasForeignAllocator(Exec->getAllocator())) {
+          spdlog::error(WasmEdge::ErrCode::Value::IncompatibleImportType);
+          return Unexpect(WasmEdge::ErrCode::Value::IncompatibleImportType);
+        }
+        const WasmEdge::ValType &ValT = Glob->getGlobalType().getValType();
+        // Numeric global: no reference to root, return the value as-is.
+        if (!ValT.isRefType()) {
+          return genWasmEdge_Value(Glob->getValue(), ValT);
+        }
+        EXPECTED_TRY(auto Retained,
+                     retainManagedRefFromSlot(
+                         *Exec, ValT, [&]() -> WasmEdge::Expect<RefVariant> {
+                           return Glob->getValue().get<RefVariant>();
+                         }));
+        return genWasmEdge_Value(Retained.first, Retained.second);
+      },
+      [&Value](auto &&Res) { *Value = *Res; }, ExecCxt, Cxt, Value);
 }
 
 WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_GlobalInstanceSetValue(
@@ -3082,6 +3338,17 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_GlobalInstanceSetValue(
         if (GlobType.getValMut() != WasmEdge::ValMut::Var) {
           spdlog::error(WasmEdge::ErrCode::Value::SetValueToConst);
           return Unexpect(WasmEdge::ErrCode::Value::SetValueToConst);
+        }
+        // Refuse a raw mutation on a global a GC controller manages, exactly
+        // as WasmEdge_TableInstanceSetData does for tables: the C-API cannot
+        // prove the caller's controller matches the owner, so a managed store
+        // here could barrier against the wrong allocator (a reachable object
+        // swept under the guest). A standalone global, a numeric or externref
+        // global, and a non-managed ref global are unaffected -- see
+        // GlobalInstance::isManagedByController().
+        if (fromGlobCxt(Cxt)->isManagedByController()) {
+          spdlog::error(WasmEdge::ErrCode::Value::IncompatibleImportType);
+          return Unexpect(WasmEdge::ErrCode::Value::IncompatibleImportType);
         }
 
         // Comparison of the value types needs the module instance to retrieve
@@ -3162,7 +3429,9 @@ WasmEdge_CallingFrameGetMemoryInstance(const WasmEdge_CallingFrameContext *Cxt,
 
 WASMEDGE_CAPI_EXPORT void
 WasmEdge_AsyncWait(const WasmEdge_Async *Cxt) noexcept {
-  if (Cxt) {
+  // Defensive: an invalid (empty shared_future) handle must never reach
+  // .wait(), which would throw future_error out of this noexcept entry.
+  if (Cxt && Cxt->Async.valid()) {
     Cxt->Async.wait();
   }
 }
@@ -3170,7 +3439,7 @@ WasmEdge_AsyncWait(const WasmEdge_Async *Cxt) noexcept {
 WASMEDGE_CAPI_EXPORT bool
 WasmEdge_AsyncWaitFor(const WasmEdge_Async *Cxt,
                       uint64_t Milliseconds) noexcept {
-  if (Cxt) {
+  if (Cxt && Cxt->Async.valid()) {
     return Cxt->Async.waitFor(std::chrono::milliseconds(Milliseconds));
   }
   return false;
@@ -3184,7 +3453,9 @@ WASMEDGE_CAPI_EXPORT void WasmEdge_AsyncCancel(WasmEdge_Async *Cxt) noexcept {
 
 WASMEDGE_CAPI_EXPORT uint32_t
 WasmEdge_AsyncGetReturnsLength(const WasmEdge_Async *Cxt) noexcept {
-  if (Cxt) {
+  // Defensive: an invalid (empty shared_future) handle must never reach
+  // .get(), which would throw future_error out of this noexcept entry.
+  if (Cxt && Cxt->Async.valid()) {
     if (auto Res = Cxt->Async.get()) {
       return static_cast<uint32_t>((*Res).size());
     }
@@ -3195,6 +3466,14 @@ WasmEdge_AsyncGetReturnsLength(const WasmEdge_Async *Cxt) noexcept {
 WASMEDGE_CAPI_EXPORT WasmEdge_Result
 WasmEdge_AsyncGet(const WasmEdge_Async *Cxt, WasmEdge_Value *Returns,
                   const uint32_t ReturnLen) noexcept {
+  // No releaseOverflowRefs here: the shared_future lets the host call again
+  // with a larger buffer and still see every reference. Overflow refs stay
+  // retained; free them via WasmEdge_VM/ExecutorReleaseAllRefs.
+  // Guard the invalid case before .get(): an empty shared_future would throw
+  // future_error out of this noexcept entry (-> terminate).
+  if (Cxt == nullptr || !Cxt->Async.valid()) {
+    return genWasmEdge_Result(ErrCode::Value::WrongVMWorkflow);
+  }
   return wrap(
       [&]() { return Cxt->Async.get(); },
       [&](auto Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); }, Cxt);
@@ -3301,7 +3580,11 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_VMRunWasmFromFile(
           return Cxt->VM.runWasmFile(genPath(Path), genStrView(FuncName),
                                      ParamPair.first, ParamPair.second);
         },
-        [&](auto Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              Cxt->VM.getExecutor().getAllocator());
+        },
         Cxt);
   } catch (...) {
     return handleCAPIError();
@@ -3331,7 +3614,11 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_VMRunWasmFromBytes(
                                      genStrView(FuncName), ParamPair.first,
                                      ParamPair.second);
         },
-        [&](auto &&Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto &&Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              Cxt->VM.getExecutor().getAllocator());
+        },
         Cxt);
   } catch (...) {
     return handleCAPIError();
@@ -3351,7 +3638,11 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_VMRunWasmFromASTModule(
                                      genStrView(FuncName), ParamPair.first,
                                      ParamPair.second);
         },
-        [&](auto &&Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto &&Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              Cxt->VM.getExecutor().getAllocator());
+        },
         Cxt, ASTCxt);
   } catch (...) {
     return handleCAPIError();
@@ -3463,7 +3754,11 @@ WasmEdge_VMExecute(WasmEdge_VMContext *Cxt, const WasmEdge_String FuncName,
           return Cxt->VM.execute(genStrView(FuncName), ParamPair.first,
                                  ParamPair.second);
         },
-        [&](auto &&Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto &&Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              Cxt->VM.getExecutor().getAllocator());
+        },
         Cxt);
   } catch (...) {
     return handleCAPIError();
@@ -3482,7 +3777,11 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Result WasmEdge_VMExecuteRegistered(
           return Cxt->VM.execute(genStrView(ModuleName), genStrView(FuncName),
                                  ParamPair.first, ParamPair.second);
         },
-        [&](auto &&Res) { fillWasmEdge_ValueArr(*Res, Returns, ReturnLen); },
+        [&](auto &&Res) {
+          fillWasmEdge_ValueArr(*Res, Returns, ReturnLen);
+          releaseOverflowRefs(*Res, Returns, ReturnLen,
+                              Cxt->VM.getExecutor().getAllocator());
+        },
         Cxt);
   } catch (...) {
     return handleCAPIError();
@@ -3496,8 +3795,14 @@ WasmEdge_VMAsyncExecute(WasmEdge_VMContext *Cxt, const WasmEdge_String FuncName,
   try {
     auto ParamPair = genParamPair(Params, ParamLen);
     if (Cxt) {
-      return new WasmEdge_Async(Cxt->VM.asyncExecute(
-          genStrView(FuncName), ParamPair.first, ParamPair.second));
+      auto Produced = Cxt->VM.asyncExecute(genStrView(FuncName),
+                                           ParamPair.first, ParamPair.second);
+      // See WasmEdge_ExecutorAsyncInvoke: a refused invoke yields an invalid
+      // Async; return nullptr rather than a handle over an empty future.
+      if (!Produced.valid()) {
+        return nullptr;
+      }
+      return new WasmEdge_Async(std::move(Produced));
     }
   } catch (...) {
     handleCAPIError();
@@ -3512,9 +3817,15 @@ WASMEDGE_CAPI_EXPORT WasmEdge_Async *WasmEdge_VMAsyncExecuteRegistered(
   try {
     auto ParamPair = genParamPair(Params, ParamLen);
     if (Cxt) {
-      return new WasmEdge_Async(
+      auto Produced =
           Cxt->VM.asyncExecute(genStrView(ModuleName), genStrView(FuncName),
-                               ParamPair.first, ParamPair.second));
+                               ParamPair.first, ParamPair.second);
+      // See WasmEdge_ExecutorAsyncInvoke: a refused invoke yields an invalid
+      // Async; return nullptr rather than a handle over an empty future.
+      if (!Produced.valid()) {
+        return nullptr;
+      }
+      return new WasmEdge_Async(std::move(Produced));
     }
   } catch (...) {
     handleCAPIError();
@@ -3560,6 +3871,40 @@ WasmEdge_VMGetFunctionTypeRegistered(const WasmEdge_VMContext *Cxt,
 WASMEDGE_CAPI_EXPORT void WasmEdge_VMCleanup(WasmEdge_VMContext *Cxt) noexcept {
   if (Cxt) {
     Cxt->VM.cleanup();
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void
+WasmEdge_VMReleaseRef(WasmEdge_VMContext *Cxt,
+                      const WasmEdge_Value Ref) noexcept {
+  // Only retained GC refs may be released (see genRetainedRef).
+  if (Cxt) {
+    if (const auto RetainedRef = genRetainedRef(Ref)) {
+      Cxt->VM.releaseRef(*RetainedRef);
+    }
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void WasmEdge_VMReleaseRefs(WasmEdge_VMContext *Cxt,
+                                                 const WasmEdge_Value *Refs,
+                                                 const uint32_t Len) noexcept {
+  if (Cxt && Refs) {
+    // Release per element, not via a vector: noexcept, and a vector sized by
+    // the host-controlled Len could throw (bad_alloc/length_error) and
+    // std::terminate. releaseRefs() forwards per element anyway.
+    for (uint32_t I = 0; I < Len; ++I) {
+      // Skip values the runtime never retains (see genRetainedRef).
+      if (const auto RetainedRef = genRetainedRef(Refs[I])) {
+        Cxt->VM.releaseRef(*RetainedRef);
+      }
+    }
+  }
+}
+
+WASMEDGE_CAPI_EXPORT void
+WasmEdge_VMReleaseAllRefs(WasmEdge_VMContext *Cxt) noexcept {
+  if (Cxt) {
+    Cxt->VM.releaseAllRefs();
   }
 }
 
@@ -3719,6 +4064,28 @@ WasmEdge_VMGetStatisticsContext(WasmEdge_VMContext *Cxt) noexcept {
 }
 
 WASMEDGE_CAPI_EXPORT void WasmEdge_VMDelete(WasmEdge_VMContext *Cxt) noexcept {
+  if (Cxt && Cxt->VM.getController().outstandingHandleLeases() > 0) {
+    // Handle-before-producer misuse: a live (undeleted) async handle still
+    // co-owns a result lease, so the teardown drain would block forever (the
+    // handle can only be released by WasmEdge_AsyncDelete). Reject fail-fast --
+    // delete every async handle produced by this VM before deleting the VM.
+    spdlog::error(
+        "WasmEdge_VMDelete called while a live async handle produced by this "
+        "VM is still undeleted. The deletion is rejected; call "
+        "WasmEdge_AsyncDelete on every async handle before deleting the VM."sv);
+    return;
+  }
+  if (Cxt && Cxt->VM.getController().currentThreadRegistered()) {
+    // Self-teardown: this thread is inside one of this VM's own running host
+    // callbacks. Deleting now would free the executor/allocator under the
+    // callback's own stack -- reject (documented usage error): the caller
+    // still owns the VM; delete it only after its invocations return.
+    spdlog::error(
+        "WasmEdge_VMDelete called from inside one of this VM's own host "
+        "callbacks (self-teardown). The deletion is rejected; delete the VM "
+        "after the invocation returns."sv);
+    return;
+  }
   delete Cxt;
 }
 
@@ -3923,7 +4290,11 @@ WasmEdge_PluginCreateModule(const WasmEdge_PluginContext *Cxt,
       if (const auto *PMod =
               fromPluginCxt(Cxt)->findModule(genStrView(ModuleName));
           PMod) {
-        return toModCxt(PMod->create().release());
+        auto *Mod = PMod->create().release();
+        // Deleted via WasmEdge_ModuleInstanceDelete -> terminate():
+        // async-pinnable (see module.h), matching the other C-API creators.
+        Mod->setDeferrableStorage();
+        return toModCxt(Mod);
       }
     }
   } catch (...) {

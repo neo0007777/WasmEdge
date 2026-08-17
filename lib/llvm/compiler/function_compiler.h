@@ -17,9 +17,10 @@ class FunctionCompiler {
 
 public:
   FunctionCompiler(LLVM::Compiler::CompileContext &Context,
-                   LLVM::FunctionCallee F, Span<const ValType> Locals,
-                   bool Interruptible, bool InstructionCounting,
-                   bool GasMeasuring, bool IsLazyJIT) noexcept;
+                   LLVM::FunctionCallee F, Span<const ValType> ParamTypes,
+                   Span<const ValType> Locals, bool Interruptible,
+                   bool InstructionCounting, bool GasMeasuring,
+                   bool IsLazyJIT) noexcept;
 
   LLVM::BasicBlock getTrapBB(ErrCode::Value Error) noexcept;
 
@@ -223,6 +224,12 @@ private:
 
   void checkPendingException() noexcept;
 
+  // GC cooperative safepoint poll. Emitted at loop headers: inline load of the
+  // controller stop flag (from the ExecCtx), and on a set flag a call to the
+  // kGCSafepoint intrinsic which parks this mutator so a concurrent
+  // collection's stop-the-world does not hang on a compute-only compiled loop.
+  void checkGCSafepoint() noexcept;
+
   void setUnreachable() noexcept;
 
   bool isUnreachable() const noexcept;
@@ -244,6 +251,19 @@ private:
   void stackPush(LLVM::Value Value) noexcept { Stack.push_back(Value); }
   LLVM::Value stackPop() noexcept;
 
+  // GC shadow-root spill. Around every site that can take this thread out of
+  // the Running state (a call that may reach a host function, table.grow's
+  // exclusive-op park, atomic.wait's block), spill every live ref LOCAL and
+  // every ref-typed OPERAND-STACK entry into the prologue-reserved shadow
+  // slots and publish a ShadowFrame on the thread's shadow-head chain, so a
+  // remote collector scanning this NativeRunning/Blocked thread finds them (a
+  // parked-at-safepoint thread scans its own native stack conservatively; a
+  // remote scan cannot, so the spill is the only root for register-held refs).
+  // pushShadowFrame returns the previous head (to restore); popShadowFrame
+  // restores it. Both are no-ops when nothing is live to spill at the site.
+  LLVM::Value pushShadowFrame() noexcept;
+  void popShadowFrame(LLVM::Value Prev) noexcept;
+
   LLVM::Value switchEndian(LLVM::Value Value);
 
   LLVM::Compiler::CompileContext &Context;
@@ -260,6 +280,23 @@ private:
   LLVM::Value TmpValues = nullptr;
   size_t TmpValuesSize = 0;
   uint64_t TmpValuesUsed = 0;
+  // GC shadow-root spill state. Indices into Local of ref-typed locals;
+  // prologue-reserved slot array + frame node. The slot array is an
+  // entry-block array alloca whose constant element count is patched to
+  // MaxShadowSlots once the body is compiled (the operand-stack depth at each
+  // spill site is only known then). The thread always runs compiled code under
+  // a registered StackManager, so ExecCtx.ShadowHead is non-null (no runtime
+  // guard needed).
+  std::vector<uint32_t> RefLocalIndices;
+  LLVM::Value ShadowSlotsAlloca = nullptr;
+  LLVM::Value ShadowFrameAlloca = nullptr;
+  uint32_t MaxShadowSlots = 0;
+  // One scratch cell for the by-pointer 128-bit argument/result of the coherent
+  // ref intrinsics. Reserved in the prologue and reused: an alloca emitted at
+  // the access site would sit inside any enclosing loop body and grow the
+  // native stack on every iteration until it hits the guard page. Unused in
+  // functions with no coherent access -- the optimizer drops it.
+  LLVM::Value CoherentSlotAlloca = nullptr;
   std::unordered_map<ErrCode::Value, LLVM::BasicBlock> TrapBB;
   bool IsUnreachable = false;
   bool Interruptible = false;
